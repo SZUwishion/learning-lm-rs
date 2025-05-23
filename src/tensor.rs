@@ -40,6 +40,14 @@ impl<T: Copy + Clone + Default> Tensor<T> {
         self.length
     }
 
+    pub fn strides(&self) -> Vec<isize> {
+        let mut strides = vec![1isize; self.shape.len()];
+        for i in (0..self.shape.len() - 1).rev() {
+            strides[i] = strides[i + 1] * self.shape[i + 1] as isize;
+        }
+        strides
+    }
+
     // Reinterpret the tensor as a new shape while preserving total size.
     pub fn reshape(&mut self, new_shape: &Vec<usize>) -> &mut Self {
         let new_length: usize = new_shape.iter().product();
@@ -88,7 +96,6 @@ impl Tensor<f32> {
         }
     }
 }
-
 #[inline]
 pub fn float_eq(x: &f32, y: &f32, rel: f32) -> bool {
     (x - y).abs() <= rel * (x.abs() + y.abs()) / 2.0
