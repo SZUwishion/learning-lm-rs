@@ -74,7 +74,7 @@ impl<
         KVCache::new(self.n_layers, self.max_seq_len, self.n_kv_h * self.dqkv, 0, device)
     }
 
-    pub fn forward(&self, input: &Tensor<u32>, cache: &mut KVCache<T>, device: &infinicore::Device, stream: &infinicore::Stream) -> Tensor<T> {
+    pub fn forward(&self, input: &Tensor<u32>, cache: &mut KVCache<T>, device: &infinicore::Device) -> Tensor<T> {
         let seq_len = input.size();
         let past_seq_len = cache.len();
         cache.increment(seq_len);
@@ -92,9 +92,9 @@ impl<
 
         // Computation Starts Here
         // Embedding lookup
-        OP::gather(&mut residual, input, &self.params.embedding_table, device, stream);
+        OP::gather(&mut residual, input, &self.params.embedding_table, device);
 
-        residual.sync_data(CPU, device.get(), device, stream);
+        residual.sync_data(CPU, device.get(), device);
 
         for layer in 0..self.n_layers {
             OP::rms_norm(
@@ -103,37 +103,34 @@ impl<
                 &self.params.rms_att_w[layer],
                 self.eps,
                 device,
-                stream
             );
 
             let q = (&mut q_buf).reshape(&vec![seq_len, self.n_q_h * self.dqkv]); // (seq, n_h * dqkv)
             let k = &mut cache.k_cache(layer, past_seq_len, device); // (seq, n_kv_h * dqkv)
             let v = &mut cache.v_cache(layer, past_seq_len, device); // (seq, n_kv_h * dqkv)
-            OP::matmul_transb(q, 0., &hidden_states, &self.params.wq[layer], 1.0, device, stream);
-            OP::matmul_transb(k, 0., &hidden_states, &self.params.wk[layer], 1.0, device, stream);
-            OP::matmul_transb(v, 0., &hidden_states, &self.params.wv[layer], 1.0, device, stream);
+            OP::matmul_transb(q, 0., &hidden_states, &self.params.wq[layer], 1.0, device);
+            OP::matmul_transb(k, 0., &hidden_states, &self.params.wk[layer], 1.0, device);
+            OP::matmul_transb(v, 0., &hidden_states, &self.params.wv[layer], 1.0, device);
 
-            q.sync_data(device.get(), CPU, device, stream);
-            k.sync_data(device.get(), CPU, device, stream);
-            v.sync_data(device.get(), CPU, device, stream);
+            q.sync_data(device.get(), CPU, device);
+            k.sync_data(device.get(), CPU, device);
+            v.sync_data(device.get(), CPU, device);
 
             OP::rope(
                 q.reshape(&vec![seq_len, self.n_q_h, self.dqkv]),
                 past_seq_len,
                 self.rope_theta,
                 device,
-                stream
             );
             OP::rope(
                 k.reshape(&vec![seq_len, self.n_kv_h, self.dqkv]),
                 past_seq_len,
                 self.rope_theta,
                 device,
-                stream
             );
 
-            q.sync_data(device.get(), CPU, device, stream);
-            k.sync_data(device.get(), CPU, device, stream);
+            q.sync_data(device.get(), CPU, device);
+            k.sync_data(device.get(), CPU, device);
 
             let full_k = &mut cache.k_cache(layer, 0, device); // (total_seq, n_kv_h * dqkv)
             let full_v = &mut cache.v_cache(layer, 0, device); // (total_seq, n_kv_h * dqkv)
@@ -150,10 +147,9 @@ impl<
                 total_seq_len,
                 self.dqkv,
                 device,
-                stream
             );
 
-            hidden_states.sync_data(CPU, device.get(), device, stream);
+            hidden_states.sync_data(CPU, device.get(), device);
 
             OP::matmul_transb(
                 &mut residual,
@@ -162,7 +158,6 @@ impl<
                 &self.params.wo[layer],
                 1.0,
                 device,
-                stream
             );
 
             mlp(
@@ -176,7 +171,6 @@ impl<
                 &self.params.rms_ffn_w[layer],
                 self.eps,
                 device,
-                stream
             );
         }
 
@@ -192,12 +186,11 @@ impl<
             &self.params.rms_out_w,
             self.eps,
             device,
-            stream
         );
 
-        OP::matmul_transb(&mut logits, 0., &hidden_states, &self.params.lm_head, 1.0, device, stream);
+        OP::matmul_transb(&mut logits, 0., &hidden_states, &self.params.lm_head, 1.0, device);
         
-        logits.sync_data(device.get(), CPU, device, stream);
+        logits.sync_data(device.get(), CPU, device);
 
         // 创建一个新的Tensor，形状为[self.vocab]
         Tensor::<T>::new(logits.data().to_vec(), &vec![self.vocab], device)
@@ -211,7 +204,6 @@ impl<
         top_k: u32,
         temperature: f32,
         device: &infinicore::Device,
-        stream: &infinicore::Stream,
     ) -> Vec<u32> {
         let mut result = Vec::<u32>::new();
 
@@ -225,11 +217,11 @@ impl<
         let input_tensor = Tensor::new(token_ids.to_vec(), &vec![token_ids.len()], device);
 
         // 获取输入序列的logits
-        let mut logits = self.forward(&input_tensor, &mut cache, device, &stream);
+        let mut logits = self.forward(&input_tensor, &mut cache, device);
 
         for _ in 0..max_len {
             // 采样下一个token
-            let next_token = OP::random_sample(&logits, top_p, top_k, temperature, device, &stream);
+            let next_token = OP::random_sample(&logits, top_p, top_k, temperature, device);
             result.push(next_token);
 
             // 检查是否生成了结束符
@@ -241,7 +233,7 @@ impl<
             let next_input = Tensor::new(vec![next_token], &vec![1], device);
 
             // 获取下一个logits
-            logits = self.forward(&next_input, &mut cache, device, &stream);
+            logits = self.forward(&next_input, &mut cache, device);
         }
 
         result
@@ -255,7 +247,6 @@ impl<
         top_k: u32,
         temperature: f32,
         device: &infinicore::Device,
-        stream: &infinicore::Stream,
     ) {
         println!("Enter your message(type 'exit' to quit):");
         let mut input = String::new();
@@ -266,8 +257,7 @@ impl<
             }
             let binding = tokenizer.encode(input.clone(), true).unwrap();
             let input_ids = binding.get_ids();
-            let mut result = self.generate(&input_ids, max_len, top_p, top_k, temperature, device, &stream);
-            stream.synchronize();
+            let mut result = self.generate(&input_ids, max_len, top_p, top_k, temperature, device);
             println!("{}", tokenizer.decode(&result, true).unwrap());
         }
     }
@@ -285,7 +275,6 @@ pub fn self_attention<T: Copy + Clone + Default + Into<f32> + std::fmt::Debug>(
     total_seq_len: usize,
     dqkv: usize,
     device: &infinicore::Device,
-    stream: &infinicore::Stream,
 ) {
     let mut att_output = Tensor::<T>::default(&vec![seq_len, n_kv_h, n_groups, dqkv], device);
 
@@ -321,11 +310,10 @@ pub fn self_attention<T: Copy + Clone + Default + Into<f32> + std::fmt::Debug>(
                 &k_slice,
                 1.0 / (dqkv as f32).sqrt(),
                 device,
-                stream
             );
 
             // 2. 应用因果掩码和softmax
-            OP::causal_softmax(&mut score_slice, device, stream);
+            OP::causal_softmax(&mut score_slice, device);
 
             // 3. 计算注意力输出
             // 修改v的slice方式：与k相同
@@ -337,8 +325,8 @@ pub fn self_attention<T: Copy + Clone + Default + Into<f32> + std::fmt::Debug>(
             let v_slice = Tensor::new(v_data, &vec![total_seq_len, dqkv], device);
 
             let mut output_data = Tensor::<T>::default(&vec![seq_len, dqkv], device);
-            OP::matmul(&mut output_data, 0.0, &score_slice, &v_slice, 1.0, device, stream);
-            output_data.sync_data(device.get(), CPU, device, stream);
+            OP::matmul(&mut output_data, 0.0, &score_slice, &v_slice, 1.0, device);
+            output_data.sync_data(device.get(), CPU, device);
             for s in 0..seq_len {
                 let mut output_slice = att_output.slice(
                     s * n_kv_h * n_groups * dqkv + (h * n_groups + g) * dqkv,
@@ -370,17 +358,16 @@ fn mlp<T: Copy + Clone + Default + Into<f32> + std::fmt::Debug>(
     rms_w: &Tensor<T>,
     eps: f32,
     device: &infinicore::Device,
-    stream: &infinicore::Stream,
 ) {
-    OP::rms_norm(hidden_states, residual, rms_w, eps, device, stream);
+    OP::rms_norm(hidden_states, residual, rms_w, eps, device);
 
-    OP::matmul_transb(gate, 0.0, hidden_states, w_gate, 1.0, device, stream);
-    OP::matmul_transb(up, 0.0, hidden_states, w_up, 1.0, device, stream);
+    OP::matmul_transb(gate, 0.0, hidden_states, w_gate, 1.0, device);
+    OP::matmul_transb(up, 0.0, hidden_states, w_up, 1.0, device);
 
-    OP::swiglu(up, gate, device, stream);
+    OP::swiglu(up, gate, device);
     // device.synchronize();
 
-    OP::matmul_transb(residual, 1.0, up, w_down, 1.0, device, stream);
+    OP::matmul_transb(residual, 1.0, up, w_down, 1.0, device);
 }
 
 // #[test]

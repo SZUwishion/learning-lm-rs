@@ -34,7 +34,6 @@ fn main() {
         }
     };
     device.set_device();
-    let stream = device.stream();
     let project_dir = env!("CARGO_MANIFEST_DIR");
     let model_dir = PathBuf::from(project_dir).join("models").join("story");
     let llama = model::Llama::<f32>::from_safetensors(&model_dir, &device);
@@ -42,13 +41,13 @@ fn main() {
 
     match args.mode.as_str() {
         "chat" => {
-            llama.chat(&tokenizer, 50, 0.8, 30, 1., &device, &stream);
+            llama.chat(&tokenizer, 50, 0.8, 30, 1., &device);
         }
         "generate" => {
             let input = "Once upon a time";
             let binding = tokenizer.encode(input, true).unwrap();
             let input_ids = binding.get_ids();
-            let output_ids = llama.generate(input_ids, 500, 0.8, 30, 1., &device, &stream);
+            let output_ids = llama.generate(input_ids, 500, 0.8, 30, 1., &device);
             println!("{}", tokenizer.decode(&output_ids, true).unwrap());
         }
         _ => {

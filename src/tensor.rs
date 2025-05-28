@@ -103,7 +103,7 @@ impl<T: Copy + Clone + Default> Tensor<T> {
     }
 
     #[inline]
-    pub fn sync_data(&mut self, src: DeviceType, dst: DeviceType, device: &infinicore::Device, stream: &infinicore::Stream) {
+    pub fn sync_data(&mut self, src: DeviceType, dst: DeviceType, device: &infinicore::Device) {
         match (src, dst) {
             (DeviceType::CPU, DeviceType::CPU) => {}
             (DeviceType::CPU, DeviceType::CUDA) => {

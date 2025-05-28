@@ -17,7 +17,7 @@ pub fn convert_type<T: Copy + Clone + Default>() -> digit_layout::DigitLayout {
     }
 }
 
-pub fn add<T: Copy + Clone + Default>(y: &mut Tensor<T>, x: &Tensor<T>, device: &infinicore::Device, stream: &infinicore::Stream) {
+pub fn add<T: Copy + Clone + Default>(y: &mut Tensor<T>, x: &Tensor<T>, device: &infinicore::Device) {
     let y_shape = y.shape();
     let x_shape = x.shape();
     assert!(y_shape.len() == x_shape.len());
@@ -70,7 +70,7 @@ pub fn add<T: Copy + Clone + Default>(y: &mut Tensor<T>, x: &Tensor<T>, device: 
                 y.dev_blob_ptr_mut() as *mut _,
                 x.dev_blob_ptr() as *const _,
                 y.dev_blob_ptr() as *const _,
-                stream.as_raw()
+                std::ptr::null_mut()
             ));
         }
     }
@@ -82,7 +82,6 @@ pub fn gather<T: Copy + Clone + Default>(
     indices: &Tensor<u32>,
     table: &Tensor<T>,
     device: &infinicore::Device,
-    stream: &infinicore::Stream,
 ) {
     let length = indices.size();
     let table_shape = table.shape();
@@ -112,7 +111,6 @@ pub fn rope<
     start_pos: usize,
     theta: f32,
     device: &infinicore::Device,
-    stream: &infinicore::Stream,
 ) {
     let shape = y.shape();
     assert!(shape.len() == 3);
@@ -260,7 +258,7 @@ pub fn rope<
 //     }
 // }
 
-pub fn causal_softmax<T: Copy + Clone + Default>(y: &mut Tensor<T>, device: &infinicore::Device, stream: &infinicore::Stream) {
+pub fn causal_softmax<T: Copy + Clone + Default>(y: &mut Tensor<T>, device: &infinicore::Device) {
     let shape = y.shape();
     let nbytes = convert_type::<T>().nbytes() as isize;
     let strides = y.strides().iter().map(|&s| s * nbytes).collect::<Vec<_>>();
@@ -306,7 +304,7 @@ pub fn causal_softmax<T: Copy + Clone + Default>(y: &mut Tensor<T>, device: &inf
                 workspace_size,
                 y.dev_blob_ptr_mut() as *mut _,
                 y.dev_blob_ptr() as *const _,
-                stream.as_raw()
+                std::ptr::null_mut()
             ));
         }
     }
@@ -320,7 +318,6 @@ pub fn rms_norm<T: Copy + Clone + Default>(
     w: &Tensor<T>,
     epsilon: f32,
     device: &infinicore::Device,
-    stream: &infinicore::Stream,
 ) {
     let x_shape = x.shape();
     let y_shape = y.shape();
@@ -389,7 +386,7 @@ pub fn rms_norm<T: Copy + Clone + Default>(
                 y.dev_blob_ptr_mut() as *mut _,
                 x.dev_blob_ptr() as *const _,
                 w.dev_blob_ptr() as *const _,
-                stream.as_raw()
+                std::ptr::null_mut()
             ));
         }
     }
@@ -446,7 +443,7 @@ pub fn rms_norm<T: Copy + Clone + Default>(
 //     infini!(infiniopDestroySwiGLUDescriptor(desc));
 // }
 
-pub fn swiglu<T: Copy + Clone + Default>(y: &mut Tensor<T>, x: &Tensor<T>, device: &infinicore::Device, stream: &infinicore::Stream) {
+pub fn swiglu<T: Copy + Clone + Default>(y: &mut Tensor<T>, x: &Tensor<T>, device: &infinicore::Device) {
     let y_shape = y.shape();
     let x_shape = x.shape();
 
@@ -501,7 +498,7 @@ pub fn swiglu<T: Copy + Clone + Default>(y: &mut Tensor<T>, x: &Tensor<T>, devic
                 y.dev_blob_ptr_mut() as *mut _,
                 y.dev_blob_ptr() as *const _,
                 x.dev_blob_ptr() as *const _,
-                stream.as_raw()
+                std::ptr::null_mut()
             ));
         }
     }
@@ -518,7 +515,6 @@ pub fn matmul_transb<T: Copy + Clone + Default + Into<f32>>(
     b: &Tensor<T>,
     alpha: f32,
     device: &infinicore::Device,
-    stream: &infinicore::Stream,
 ) {
     let c_shape = c.shape();
     let a_shape = a.shape();
@@ -572,6 +568,7 @@ pub fn matmul_transb<T: Copy + Clone + Default + Into<f32>>(
     let mut workspace_size: usize = 0;
     infini!(infiniopGetGemmWorkspaceSize(desc, &mut workspace_size));
 
+    device.synchronize();
     match device.get() {
         DeviceType::CPU => {
             let mut workspace = vec![0u8; workspace_size];
@@ -598,8 +595,9 @@ pub fn matmul_transb<T: Copy + Clone + Default + Into<f32>>(
                 b.dev_blob_ptr() as *const _,
                 alpha,
                 beta,
-                stream.as_raw()
+                std::ptr::null_mut()
             ));
+            device.synchronize();
         }
     }
 
@@ -613,7 +611,6 @@ pub fn matmul<T: Copy + Clone + Default + Into<f32>>(
     b: &Tensor<T>,
     alpha: f32,
     device: &infinicore::Device,
-    stream: &infinicore::Stream,
 ) {
     let c_shape = c.shape();
     let a_shape = a.shape();
@@ -687,7 +684,7 @@ pub fn matmul<T: Copy + Clone + Default + Into<f32>>(
                 b.dev_blob_ptr() as *const _,
                 alpha.into(),
                 beta.into(),
-                stream.as_raw()
+                std::ptr::null_mut()
             ));
         }
     }
@@ -701,7 +698,6 @@ pub fn dot<T: Copy + Clone + Default + std::ops::Mul<Output = T> + std::ops::Add
     x: &Tensor<T>,
     y: &Tensor<T>,
     device: &infinicore::Device,
-    stream: &infinicore::Stream,
 ) -> T {
     let len = x.size();
     assert!(len == y.size());
@@ -785,7 +781,6 @@ pub fn random_sample<T: Copy + Clone + Default>(
     top_k: u32,
     temperature: f32,
     device: &infinicore::Device,
-    stream: &infinicore::Stream,
 ) -> u32 {
     let shape = x.shape();
     let nbytes = types::F32.nbytes() as isize;
@@ -843,10 +838,11 @@ pub fn random_sample<T: Copy + Clone + Default>(
                 top_p,
                 top_k as i32,
                 temperature,
-                stream.as_raw()
+                std::ptr::null_mut()
             ));
         }
     }
+    indices.sync_data(device.get(), DeviceType::CPU, device);
 
     infini!(infiniopDestroyRandomSampleDescriptor(desc));
 
