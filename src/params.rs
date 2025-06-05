@@ -1,42 +1,43 @@
 use crate::config::LlamaConfigJson;
 use crate::tensor::Tensor;
 use safetensors::SafeTensors;
-use half::bf16;
+use half::{bf16, f16};
 
-pub struct LLamaParams<T> {
+pub struct LLamaParams<'a, T> {
     // token_id to embedding lookup table
-    pub embedding_table: Tensor<T>, // (vocab_size, dim)
+    pub embedding_table: Tensor<'a, T>, // (vocab_size, dim)
     // decoder layer
-    pub rms_att_w: Vec<Tensor<T>>, // (hidden_size, ) x layers
-    pub wq: Vec<Tensor<T>>,        // (n_heads * head_size, hidden_size) x layers
-    pub wk: Vec<Tensor<T>>,        // (n_kv_heads * head_size, hidden_size) x layers
-    pub wv: Vec<Tensor<T>>,        // (n_kv_heads * head_size, hidden_size) x layers
-    pub wo: Vec<Tensor<T>>,        // (hidden_size, n_heads * head_size) x layers
+    pub rms_att_w: Vec<Tensor<'a, T>>, // (hidden_size, ) x layers
+    pub wq: Vec<Tensor<'a, T>>,        // (n_heads * head_size, hidden_size) x layers
+    pub wk: Vec<Tensor<'a, T>>,        // (n_kv_heads * head_size, hidden_size) x layers
+    pub wv: Vec<Tensor<'a, T>>,        // (n_kv_heads * head_size, hidden_size) x layers
+    pub wo: Vec<Tensor<'a, T>>,        // (hidden_size, n_heads * head_size) x layers
     // ffn layer
-    pub rms_ffn_w: Vec<Tensor<T>>, // (hidden_size, ) x layers
-    pub w_up: Vec<Tensor<T>>,      // (intermediate_size, hidden_size) x layers
-    pub w_gate: Vec<Tensor<T>>,    // (intermediate_size, hidden_size) x layers
-    pub w_down: Vec<Tensor<T>>,    // (hidden_size, intermediate_size) x layers
+    pub rms_ffn_w: Vec<Tensor<'a, T>>, // (hidden_size, ) x layers
+    pub w_up: Vec<Tensor<'a, T>>,      // (intermediate_size, hidden_size) x layers
+    pub w_gate: Vec<Tensor<'a, T>>,    // (intermediate_size, hidden_size) x layers
+    pub w_down: Vec<Tensor<'a, T>>,    // (hidden_size, intermediate_size) x layers
     // output
-    pub rms_out_w: Tensor<T>, // (hidden_size, )
-    pub lm_head: Tensor<T>,   // (vocab_size, dim)
+    pub rms_out_w: Tensor<'a, T>, // (hidden_size, )
+    pub lm_head: Tensor<'a, T>,   // (vocab_size, dim)
 }
 
-impl<T: Clone + Copy + Default + Into<f32> + From<f32>> LLamaParams<T> {
-    pub fn from_safetensors(safetensor: &SafeTensors, config: &LlamaConfigJson, device: &infinicore::Device) -> Self {
-        let get_tensor = |name: &str| -> Tensor<T> {
+impl<'a, T> LLamaParams<'a, T> 
+{
+    pub fn from_safetensors(safetensor: &SafeTensors, config: &LlamaConfigJson, device: &'a infinicore::Device) -> Self 
+    where 
+        T: Copy + Clone + Default + From<f32>
+    {
+        let get_tensor = |name: &str| -> Tensor<'a, T> {
             let tensor = safetensor.tensor(name).unwrap();
             let shape = tensor.shape().to_vec();
             let data = tensor.data();
             let data: Vec<T> = match tensor.dtype() {
-                safetensors::Dtype::F32 => unsafe {
-                    std::slice::from_raw_parts(data.as_ptr() as *const T, data.len() / 4).to_vec()
+                safetensors::Dtype::F32 => {
+                    unsafe { std::slice::from_raw_parts(data.as_ptr() as *const T, data.len() / 4).to_vec() }
                 },
-                safetensors::Dtype::F16 => unsafe {
-                    std::slice::from_raw_parts(data.as_ptr() as *const T, data.len() / 2).to_vec()
-                },
-                safetensors::Dtype::BF16 => unsafe {
-                    let data: Vec<u16> = std::slice::from_raw_parts(data.as_ptr() as *const u16, data.len() / 2).to_vec();
+                safetensors::Dtype::BF16 => {
+                    let data: Vec<u16> = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u16, data.len() / 2).to_vec() };
                     data.iter().map(|&x| T::from(f32::from(bf16::from_bits(x)))).collect()
                 },
                 _ => panic!("不支持的数据类型: {:?}", tensor.dtype()),

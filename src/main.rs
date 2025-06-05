@@ -10,6 +10,7 @@ use tokenizers::Tokenizer;
 
 use clap::{Parser, command, arg};
 use infinicore::{Device, DeviceType};
+use half::f16;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -20,6 +21,9 @@ struct Args {
 
     #[arg(short, long, default_value = "cpu")]
     device: String,
+
+    #[arg(short, long, default_value = "f32")]
+    dtype: String,
 }
 
 fn main() {
@@ -36,7 +40,14 @@ fn main() {
     device.set_device();
     let project_dir = env!("CARGO_MANIFEST_DIR");
     let model_dir = PathBuf::from(project_dir).join("models").join("story");
-    let llama = model::Llama::<f32>::from_safetensors(&model_dir, &device);
+    let llama = match args.dtype.as_str() {
+        // "f16" => model::Llama::<f16>::from_safetensors(&model_dir, true, &device),
+        "f32" => model::Llama::<f32>::from_safetensors(&model_dir, false, &device),
+        _ => {
+            println!("Invalid dtype");
+            return;
+        }
+    };
     let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json")).unwrap();
 
     match args.mode.as_str() {
