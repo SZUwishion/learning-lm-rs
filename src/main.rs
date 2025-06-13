@@ -21,9 +21,6 @@ struct Args {
 
     #[arg(short, long, default_value = "cpu")]
     device: String,
-
-    #[arg(short, long, default_value = "f32")]
-    dtype: String,
 }
 
 fn main() {
@@ -38,27 +35,21 @@ fn main() {
         }
     };
     device.set_device();
+    let stream = device.stream();
     let project_dir = env!("CARGO_MANIFEST_DIR");
     let model_dir = PathBuf::from(project_dir).join("models").join("story");
-    let llama = match args.dtype.as_str() {
-        // "f16" => model::Llama::<f16>::from_safetensors(&model_dir, true, &device),
-        "f32" => model::Llama::<f32>::from_safetensors(&model_dir, false, &device),
-        _ => {
-            println!("Invalid dtype");
-            return;
-        }
-    };
+    let llama = model::Llama::<f32>::from_safetensors(&model_dir, false, &device, &stream);
     let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json")).unwrap();
 
     match args.mode.as_str() {
         "chat" => {
-            llama.chat(&tokenizer, 50, 0.8, 30, 1., &device);
+            llama.chat(&tokenizer, 50, 0.8, 30, 1., &device, &stream);
         }
         "generate" => {
             let input = "Once upon a time";
             let binding = tokenizer.encode(input, true).unwrap();
             let input_ids = binding.get_ids();
-            let output_ids = llama.generate(input_ids, 500, 0.8, 30, 1., &device);
+            let output_ids = llama.generate(input_ids, 500, 0.8, 30, 1., &device, &stream);
             println!("{}", tokenizer.decode(&output_ids, true).unwrap());
         }
         _ => {

@@ -12,18 +12,23 @@ pub struct Tensor<'a, T> {
     length: usize,
     device: &'a infinicore::Device,
     dev_blob: Option<infinicore::DevBlob>,
+    stream: &'a infinicore::Stream,
 }
 
 impl<'a, T: Copy + Clone + Default> Tensor<'a, T> {
-    pub fn new(data: Vec<T>, shape: &Vec<usize>, device: &'a infinicore::Device) -> Self {
+    pub fn new(data: Vec<T>, shape: &Vec<usize>, device: &'a infinicore::Device, stream: &'a infinicore::Stream) -> Self {
         let length = data.len();
         let dev_blob = match device.get() {
             infinicore::DeviceType::CPU => None,
-            infinicore::DeviceType::CUDA => Some(device.from_host(&data)),
+            infinicore::DeviceType::CUDA => Some(stream.from_host(&data)),
         };
         let mut strides = vec![1isize; shape.len()];
-        for i in (0..shape.len() - 1).rev() {
-            strides[i] = strides[i + 1] * shape[i + 1] as isize;
+        if shape.len() == 0 {
+            strides = vec![1isize];
+        } else {
+            for i in (0..shape.len() - 1).rev() {
+                strides[i] = strides[i + 1] * shape[i + 1] as isize;
+            }
         }
         Tensor {
             data: Arc::new(data.into_boxed_slice().try_into().unwrap()),
@@ -33,13 +38,14 @@ impl<'a, T: Copy + Clone + Default> Tensor<'a, T> {
             length,
             device,
             dev_blob,
+            stream
         }
     }
 
-    pub fn default(shape: &Vec<usize>, device: &'a infinicore::Device) -> Self {
+    pub fn default(shape: &Vec<usize>, device: &'a infinicore::Device, stream: &'a infinicore::Stream) -> Self {
         let length = shape.iter().product();
         let data = vec![T::default(); length];
-        Self::new(data, shape, device)
+        Self::new(data, shape, device, stream)
     }
 
     pub fn data(&self) -> &[T] {
@@ -59,9 +65,13 @@ impl<'a, T: Copy + Clone + Default> Tensor<'a, T> {
         self.device
     }
 
-    // pub fn dev_blob(&self) -> &infinicore::DevBlob {
-    //     self.dev_blob.as_ref().unwrap()
-    // }
+    pub fn dev_blob(&self) -> &infinicore::DevBlob {
+        self.dev_blob.as_ref().unwrap()
+    }
+
+    pub fn dev_blob_mut(&mut self) -> &mut infinicore::DevBlob {
+        self.dev_blob.as_mut().unwrap()
+    }
 
     pub fn dev_blob_ptr(&self) -> *const T {
         unsafe { self.dev_blob.as_ref().unwrap().as_raw().add(self.offset) as *const T }
@@ -95,81 +105,9 @@ impl<'a, T: Copy + Clone + Default> Tensor<'a, T> {
         self.strides == self.compact_strides()
     }
 
-    pub fn compact(&mut self) {
-        if self.is_compact() {
-            return;
-        }
-
-        // let shape = self.shape.clone();
-        // let src_strides = self.strides.clone();
-        // let mut dst_strides = self.compact_strides();
-
-        // let nbytes = convert_type::<T>().nbytes() as isize;
-
-        // let src_desc = infinicore::Tensor::new(convert_type::<T>(), shape.iter().copied(), src_strides.iter().map(|&s| s * nbytes).collect::<Vec<_>>());
-        // let dst_desc = infinicore::Tensor::new(convert_type::<T>(), shape.iter().copied(), dst_strides.iter().map(|&s| s * nbytes).collect::<Vec<_>>());
-
-        // let handle= infinicore::Handle::new();
-        // let mut desc: *mut infinicore::bindings::InfiniopDescriptor = std::ptr::null_mut();
-
-        // infini!(infiniopCreateRearrangeDescriptor(
-        //     handle.as_raw(),
-        //     &mut desc,
-        //     dst_desc.as_raw(),
-        //     src_desc.as_raw()
-        // ));
-
-        // match self.device.get() {
-        //     infinicore::DeviceType::CPU => {
-        //         infini!(infiniopRearrange(
-        //             desc,
-        //             self.data_mut().as_mut_ptr() as *mut _,
-        //             self.data().as_ptr() as *const _,
-        //             std::ptr::null_mut()
-        //         ));
-        //     }
-        //     infinicore::DeviceType::CUDA => {
-        //         infini!(infiniopRearrange(desc,
-        //             self.dev_blob_ptr_mut() as *mut _,
-        //             self.dev_blob_ptr() as *const _,
-        //             std::ptr::null_mut()
-        //         ));
-        //     }
-        // }
-
-        let mut new_strides = vec![1isize; self.shape.len()];
-        for i in (0..self.shape.len() - 1).rev() {
-            new_strides[i] = new_strides[i + 1] * self.shape[i + 1] as isize;
-        }
-        let mut new_data = vec![T::default(); self.length];
-
-        let total_elements = self.length;
-        let mut indices = vec![0usize; self.shape.len()];
-        for i in 0..total_elements {
-            let mut src_offset = self.offset;
-            let mut dst_offset = 0;
-            for j in 0..self.shape.len() {
-                src_offset += indices[j] * self.strides[j] as usize;
-                dst_offset += indices[j] * new_strides[j] as usize;
-            }
-            new_data[dst_offset] = self.data[src_offset];
-            for j in (0..self.shape.len()).rev() {
-                indices[j] += 1;
-                if indices[j] < self.shape[j] {
-                    break;
-                }
-                indices[j] = 0;
-            }
-        }
-
+    pub fn as_strided(&mut self, new_strides: &Vec<isize>) -> &mut Self {
         self.strides = new_strides.clone();
-        unsafe {
-            self.data_mut().copy_from_slice(&new_data);
-        }
-
-        if self.device.get() == DeviceType::CUDA {
-            self.sync_data(DeviceType::CPU, DeviceType::CUDA);
-        }
+        self
     }
 
     pub fn reshape(&mut self, new_shape: &Vec<usize>) -> &mut Self {
@@ -210,23 +148,70 @@ impl<'a, T: Copy + Clone + Default> Tensor<'a, T> {
             device: self.device,
             dev_blob: match self.device.get() {
                 infinicore::DeviceType::CPU => None,
-                infinicore::DeviceType::CUDA => self.dev_blob.clone(),
+                infinicore::DeviceType::CUDA => Some(self.dev_blob.as_ref().unwrap().slice(self.offset + start, new_length * convert_type::<T>().nbytes())),
             },
+            stream: self.stream
         }
     }
 
     pub fn permute(&mut self, new_axes: &Vec<usize>) -> &mut Self {
+        let mut dst_strides = Vec::with_capacity(self.shape.len());
         let mut new_shape = Vec::with_capacity(self.shape.len());
-        let mut new_strides = Vec::with_capacity(self.shape.len());
+        let mut new_strides = vec![1isize; self.shape.len()];
 
         for &idx in new_axes {
             new_shape.push(self.shape[idx]);
-            new_strides.push(self.strides[idx]);
         }
 
-        self.shape.copy_from_slice(&new_shape);
-        self.strides.copy_from_slice(&new_strides);
-        self.compact();
+        for i in (0..self.shape.len() - 1).rev() {
+            new_strides[i] = new_strides[i + 1] * new_shape[i + 1] as isize;
+        }
+
+        for &idx in new_axes {
+            dst_strides.push(new_strides[idx]);
+        }
+
+        let shape = self.shape.clone();
+        let src_strides = self.strides.clone();
+
+        let nbytes = convert_type::<T>().nbytes() as isize;
+
+        let src_desc = infinicore::Tensor::new(convert_type::<T>(), shape.iter().copied(), src_strides.iter().map(|&s| s * nbytes).collect::<Vec<_>>());
+        let dst_desc = infinicore::Tensor::new(convert_type::<T>(), shape.iter().copied(), dst_strides.iter().map(|&s| s * nbytes).collect::<Vec<_>>());
+
+        let handle= infinicore::Handle::new();
+        let mut desc: *mut infinicore::bindings::InfiniopDescriptor = std::ptr::null_mut();
+
+        infini!(infiniopCreateRearrangeDescriptor(
+            handle.as_raw(),
+            &mut desc,
+            dst_desc.as_raw(),
+            src_desc.as_raw()
+        ));
+
+        match self.device.get() {
+            infinicore::DeviceType::CPU => {
+                let new_data = self.data().to_vec();
+                infini!(infiniopRearrange(
+                    desc,
+                    self.data_mut().as_mut_ptr() as *mut _,
+                    new_data.as_ptr() as *const _,
+                    std::ptr::null_mut()
+                ));
+            }
+            infinicore::DeviceType::CUDA => {
+                let mut new_data = self.stream.malloc(self.length * convert_type::<T>().nbytes());
+                self.stream.memcpy_d2d(&mut new_data, self.dev_blob());
+                infini!(infiniopRearrange(desc,
+                    self.dev_blob_ptr_mut() as *mut _,
+                    new_data.as_raw() as *const _,
+                    self.stream.as_raw()
+                ));
+                self.stream.free(new_data);
+            }
+        }
+
+        infini!(infiniopDestroyRearrangeDescriptor(desc));
         self
     }
 
@@ -238,16 +223,16 @@ impl<'a, T: Copy + Clone + Default> Tensor<'a, T> {
                 let data_ptr = unsafe { self.data_ptr() };
                 let data_len = self.length;
                 let slice = unsafe { slice::from_raw_parts(data_ptr, data_len) };
-                self.device
-                    .memcpy_h2d(self.dev_blob.as_mut().unwrap(), slice);
+                self.stream.memcpy_h2d(self.dev_blob_mut(), slice);
             }
             (DeviceType::CUDA, DeviceType::CPU) => {
-                let blob = self.dev_blob.as_ref().unwrap();
+                let blob_ptr = self.dev_blob_ptr();
                 let data_ptr = unsafe { self.data_ptr() };
                 let data_len = self.length;
                 unsafe {
                     let mut_slice = slice::from_raw_parts_mut(data_ptr as *mut T, data_len);
-                    self.device.memcpy_d2h(mut_slice, blob);
+                    let blob = slice::from_raw_parts(blob_ptr as *const infinicore::DevByte, data_len * convert_type::<T>().nbytes());
+                    self.stream.memcpy_d2h(mut_slice, blob);
                 }
             }
             (DeviceType::CUDA, DeviceType::CUDA) => {}

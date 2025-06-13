@@ -11,13 +11,13 @@ pub struct KVCache<'a, T> {
 }
 
 impl<'a, T: Default + Copy> KVCache<'a, T> {
-    pub fn new(n_layers: usize, max_seq_len: usize, dim: usize, init_len: usize, device: &'a infinicore::Device) -> Self {
+    pub fn new(n_layers: usize, max_seq_len: usize, dim: usize, init_len: usize, device: &'a infinicore::Device, stream: &'a infinicore::Stream) -> Self {
         KVCache {
             k_cache: (0..n_layers)
-                .map(|_| Tensor::default(&vec![max_seq_len, dim], device))
+                .map(|_| Tensor::default(&vec![max_seq_len, dim], device, stream))
                 .collect(),
             v_cache: (0..n_layers)
-                .map(|_| Tensor::default(&vec![max_seq_len, dim], device))
+                .map(|_| Tensor::default(&vec![max_seq_len, dim], device, stream))
                 .collect(),
             max_seq_len: max_seq_len,
             dim: dim,

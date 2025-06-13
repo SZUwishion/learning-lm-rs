@@ -24,7 +24,7 @@ pub struct LLamaParams<'a, T> {
 
 impl<'a, T> LLamaParams<'a, T> 
 {
-    pub fn from_safetensors(safetensor: &SafeTensors, config: &LlamaConfigJson, device: &'a infinicore::Device) -> Self 
+    pub fn from_safetensors(safetensor: &SafeTensors, config: &LlamaConfigJson, device: &'a infinicore::Device, stream: &'a infinicore::Stream) -> Self 
     where 
         T: Copy + Clone + Default + From<f32>
     {
@@ -42,7 +42,7 @@ impl<'a, T> LLamaParams<'a, T>
                 },
                 _ => panic!("不支持的数据类型: {:?}", tensor.dtype()),
             };
-            Tensor::new(data, &shape, device)
+            Tensor::new(data, &shape, device, stream)
         };
 
         let n_layers = config.num_hidden_layers;

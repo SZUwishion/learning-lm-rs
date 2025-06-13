@@ -17,7 +17,7 @@ pub fn convert_type<T: Copy + Clone + Default>() -> digit_layout::DigitLayout {
     }
 }
 
-pub fn add<T: Copy + Clone + Default>(y: &mut Tensor<T>, x: &Tensor<T>, device: &infinicore::Device) {
+pub fn add<T: Copy + Clone + Default>(y: &mut Tensor<T>, x: &Tensor<T>, device: &infinicore::Device, stream: &infinicore::Stream) {
     let y_shape = y.shape();
     let x_shape = x.shape();
     assert!(y_shape.len() == x_shape.len());
@@ -58,11 +58,11 @@ pub fn add<T: Copy + Clone + Default>(y: &mut Tensor<T>, x: &Tensor<T>, device: 
                 y.data_mut().as_mut_ptr() as *mut _,
                 x.data().as_ptr() as *const _,
                 y.data().as_ptr() as *const _,
-                std::ptr::null_mut()
+                stream.as_raw()
             ));
         }
         DeviceType::CUDA => {
-            let mut workspace = device.malloc::<u8>(workspace_size);
+            let mut workspace = stream.malloc(workspace_size);
             infini!(infiniopAdd(
                 desc,
                 workspace.as_raw() as *mut _,
@@ -70,7 +70,7 @@ pub fn add<T: Copy + Clone + Default>(y: &mut Tensor<T>, x: &Tensor<T>, device: 
                 y.dev_blob_ptr_mut() as *mut _,
                 x.dev_blob_ptr() as *const _,
                 y.dev_blob_ptr() as *const _,
-                std::ptr::null_mut()
+                stream.as_raw()
             ));
         }
     }
@@ -82,6 +82,7 @@ pub fn gather<T: Copy + Clone + Default>(
     indices: &Tensor<u32>,
     table: &Tensor<T>,
     device: &infinicore::Device,
+    stream: &infinicore::Stream,
 ) {
     let length = indices.size();
     let table_shape = table.shape();
@@ -96,7 +97,7 @@ pub fn gather<T: Copy + Clone + Default>(
 }
 
 // RoPE: Rotary Positional Embedding
-pub fn rope<
+pub fn new_rope<
     T: Copy
         + Clone
         + Default
@@ -133,22 +134,23 @@ pub fn rope<
     }
 }
 
-pub fn new_rope<T: Copy + Clone + Default + Into<f32> + From<f32> + std::fmt::Debug>(
+pub fn rope<T: Copy + Clone + Default + Into<f32> + From<f32> + std::fmt::Debug>(
     y: &mut Tensor<T>,
     start_pos: usize,
     theta: f32,
+    device: &infinicore::Device,
+    stream: &infinicore::Stream,
 ) {
     let nbytes = convert_type::<T>().nbytes() as isize;
     let shape = y.shape().to_vec();
-    let strides = y.strides().iter().map(|&s| s * nbytes).collect::<Vec<_>>();
 
     let seq_len = shape[0];
     let n_heads = shape[1];
     let d = shape[2];
 
-    println!("y: {:?}", y.data());
     y.reshape(&vec![seq_len, n_heads, 2, d / 2]).permute(&vec![0, 1, 3, 2]).reshape(&shape);
-    println!("y: {:?}", y.data());
+
+    let strides = y.strides().iter().map(|&s| s * nbytes).collect::<Vec<_>>();
     
     assert!(shape.len() == 3);
 
@@ -161,7 +163,7 @@ pub fn new_rope<T: Copy + Clone + Default + Into<f32> + From<f32> + std::fmt::De
 
     
     // 创建位置ID张量
-    let pos_ids: Vec<u32> = (0..seq_len).map(|i| i as u32).collect();
+    let mut pos_ids: Vec<u32> = (0..seq_len).map(|i| i as u32).collect();
     let pos_desc = infinicore::Tensor::new(
         types::U32,
         std::iter::once(shape[0]),
@@ -207,20 +209,44 @@ pub fn new_rope<T: Copy + Clone + Default + Into<f32> + From<f32> + std::fmt::De
     // 获取工作空间大小
     let mut workspace_size: usize = 0;
     infini!(infiniopGetRoPEWorkspaceSize(desc, &mut workspace_size));
-    let mut workspace = vec![0u8; workspace_size];
 
     // 执行RoPE操作
-    infini!(infiniopRoPE(
-        desc,
-        workspace.as_mut_ptr() as *mut _,
-        workspace_size,
-        y.data_mut().as_mut_ptr() as *mut _,
-        y.data().as_ptr() as *const _,
-        pos_ids.as_ptr() as *const _,
-        sin_table.as_ptr() as *const _,
-        cos_table.as_ptr() as *const _,
-        std::ptr::null_mut()
-    ));
+    match device.get() {
+        DeviceType::CPU => {
+            let mut workspace = vec![0u8; workspace_size];
+            infini!(infiniopRoPE(
+                desc,
+                workspace.as_mut_ptr() as *mut _,
+                workspace_size,
+                y.data_mut().as_mut_ptr() as *mut _,
+                y.data().as_ptr() as *const _,
+                pos_ids.as_ptr() as *const _,
+                sin_table.as_ptr() as *const _,
+                cos_table.as_ptr() as *const _,
+                stream.as_raw()
+            ));
+        }
+        DeviceType::CUDA => {
+            let mut workspace = stream.malloc(workspace_size);
+            let mut pos_ids_dev = stream.malloc(pos_ids.len() * 4);
+            stream.memcpy_h2d(pos_ids_dev.as_mut(), pos_ids.as_mut());
+            let mut sin_table_dev = stream.malloc(sin_table.len() * nbytes as usize);
+            stream.memcpy_h2d(sin_table_dev.as_mut(), sin_table.as_mut());
+            let mut cos_table_dev = stream.malloc(cos_table.len() * nbytes as usize);
+            stream.memcpy_h2d(cos_table_dev.as_mut(), cos_table.as_mut());
+            infini!(infiniopRoPE(
+                desc,
+                workspace.as_raw() as *mut _,
+                workspace_size,
+                y.dev_blob_ptr_mut() as *mut _,
+                y.dev_blob_ptr() as *const _,
+                pos_ids_dev.as_raw() as *const _,
+                sin_table_dev.as_raw() as *const _,
+                cos_table_dev.as_raw() as *const _,
+                stream.as_raw()
+            ));
+        }
+    }
 
     y.reshape(&vec![seq_len, n_heads, d / 2, 2]).permute(&vec![0, 1, 3, 2]).reshape(&shape);
 
@@ -263,7 +289,7 @@ pub fn new_rope<T: Copy + Clone + Default + Into<f32> + From<f32> + std::fmt::De
 //     }
 // }
 
-pub fn causal_softmax<T: Copy + Clone + Default>(y: &mut Tensor<T>, device: &infinicore::Device) {
+pub fn causal_softmax<T: Copy + Clone + Default>(y: &mut Tensor<T>, device: &infinicore::Device, stream: &infinicore::Stream) {
     let shape = y.shape();
     let nbytes = convert_type::<T>().nbytes() as isize;
     let strides = y.strides().iter().map(|&s| s * nbytes).collect::<Vec<_>>();
@@ -298,18 +324,18 @@ pub fn causal_softmax<T: Copy + Clone + Default>(y: &mut Tensor<T>, device: &inf
                 workspace_size,
                 y.data_mut().as_mut_ptr() as *mut _,
                 y.data().as_ptr() as *const _,
-                std::ptr::null_mut()
+                stream.as_raw()
             ));
         }
         DeviceType::CUDA => {
-            let mut workspace = device.malloc::<u8>(workspace_size);
+            let mut workspace = stream.malloc(workspace_size);
             infini!(infiniopCausalSoftmax(
                 desc,
                 workspace.as_raw() as *mut _,
                 workspace_size,
                 y.dev_blob_ptr_mut() as *mut _,
                 y.dev_blob_ptr() as *const _,
-                std::ptr::null_mut()
+                stream.as_raw()
             ));
         }
     }
@@ -323,6 +349,7 @@ pub fn rms_norm<T: Copy + Clone + Default>(
     w: &Tensor<T>,
     epsilon: f32,
     device: &infinicore::Device,
+    stream: &infinicore::Stream,
 ) {
     let x_shape = x.shape();
     let y_shape = y.shape();
@@ -379,11 +406,11 @@ pub fn rms_norm<T: Copy + Clone + Default>(
                 y.data_mut().as_mut_ptr() as *mut _,
                 x.data().as_ptr() as *const _,
                 w.data().as_ptr() as *const _,
-                std::ptr::null_mut()
+                stream.as_raw()
             ));
         }
         DeviceType::CUDA => {
-            let mut workspace = device.malloc::<u8>(workspace_size);
+            let mut workspace = stream.malloc(workspace_size);
             infini!(infiniopRMSNorm(
                 desc,
                 workspace.as_raw() as *mut _,
@@ -391,7 +418,7 @@ pub fn rms_norm<T: Copy + Clone + Default>(
                 y.dev_blob_ptr_mut() as *mut _,
                 x.dev_blob_ptr() as *const _,
                 w.dev_blob_ptr() as *const _,
-                std::ptr::null_mut()
+                stream.as_raw()
             ));
         }
     }
@@ -399,7 +426,7 @@ pub fn rms_norm<T: Copy + Clone + Default>(
     infini!(infiniopDestroyRMSNormDescriptor(desc));
 }
 
-pub fn swiglu<T: Copy + Clone + Default>(y: &mut Tensor<T>, x: &Tensor<T>, device: &infinicore::Device) {
+pub fn swiglu<T: Copy + Clone + Default>(y: &mut Tensor<T>, x: &Tensor<T>, device: &infinicore::Device, stream: &infinicore::Stream) {
     let y_shape = y.shape();
     let x_shape = x.shape();
 
@@ -442,11 +469,11 @@ pub fn swiglu<T: Copy + Clone + Default>(y: &mut Tensor<T>, x: &Tensor<T>, devic
                 y.data_mut().as_mut_ptr() as *mut _,
                 y.data().as_ptr() as *const _,
                 x.data().as_ptr() as *const _,
-                std::ptr::null_mut()
+                stream.as_raw()
             ));
         }
         DeviceType::CUDA => {
-            let mut workspace = device.malloc::<u8>(workspace_size);
+            let mut workspace = stream.malloc(workspace_size);
             infini!(infiniopSwiGLU(
                 desc,
                 workspace.as_raw() as *mut _,
@@ -454,7 +481,7 @@ pub fn swiglu<T: Copy + Clone + Default>(y: &mut Tensor<T>, x: &Tensor<T>, devic
                 y.dev_blob_ptr_mut() as *mut _,
                 y.dev_blob_ptr() as *const _,
                 x.dev_blob_ptr() as *const _,
-                std::ptr::null_mut()
+                stream.as_raw()
             ));
         }
     }
@@ -471,6 +498,7 @@ pub fn matmul_transb<T: Copy + Clone + Default + Into<f32>>(
     b: &Tensor<T>,
     alpha: f32,
     device: &infinicore::Device,
+    stream: &infinicore::Stream,
 ) {
     let c_shape = c.shape();
     let a_shape = a.shape();
@@ -536,11 +564,11 @@ pub fn matmul_transb<T: Copy + Clone + Default + Into<f32>>(
                 b.data().as_ptr() as *const _,
                 alpha,
                 beta,
-                std::ptr::null_mut()
+                stream.as_raw()
             ));
         }
         DeviceType::CUDA => {
-            let mut workspace = device.malloc::<u8>(workspace_size);
+            let mut workspace = stream.malloc(workspace_size);
             infini!(infiniopGemm(
                 desc,
                 workspace.as_raw() as *mut _,
@@ -550,9 +578,8 @@ pub fn matmul_transb<T: Copy + Clone + Default + Into<f32>>(
                 b.dev_blob_ptr() as *const _,
                 alpha,
                 beta,
-                std::ptr::null_mut()
+                stream.as_raw()
             ));
-            device.synchronize();
         }
     }
 
@@ -566,6 +593,7 @@ pub fn matmul<T: Copy + Clone + Default + Into<f32>>(
     b: &Tensor<T>,
     alpha: f32,
     device: &infinicore::Device,
+    stream: &infinicore::Stream,
 ) {
     let c_shape = c.shape();
     let a_shape = a.shape();
@@ -625,11 +653,11 @@ pub fn matmul<T: Copy + Clone + Default + Into<f32>>(
                 b.data().as_ptr() as *const _,
                 alpha.into(),
                 beta.into(),
-                std::ptr::null_mut()
+                stream.as_raw()
             ));
         }
         DeviceType::CUDA => {
-            let mut workspace = device.malloc::<u8>(workspace_size);
+            let mut workspace = stream.malloc(workspace_size);
             infini!(infiniopGemm(
                 desc,
                 workspace.as_raw() as *mut _,
@@ -639,7 +667,7 @@ pub fn matmul<T: Copy + Clone + Default + Into<f32>>(
                 b.dev_blob_ptr() as *const _,
                 alpha.into(),
                 beta.into(),
-                std::ptr::null_mut()
+                stream.as_raw()
             ));
         }
     }
@@ -736,6 +764,7 @@ pub fn random_sample<T: Copy + Clone + Default>(
     top_k: u32,
     temperature: f32,
     device: &infinicore::Device,
+    stream: &infinicore::Stream,
 ) -> u32 {
     let shape = x.shape();
     let nbytes = convert_type::<T>().nbytes() as isize;
@@ -747,7 +776,7 @@ pub fn random_sample<T: Copy + Clone + Default>(
     let x_desc =
         infinicore::Tensor::new(convert_type::<T>(), shape.iter().copied(), strides.iter().copied());
 
-    let mut indices = Tensor::<u32>::new(vec![0], &vec![], x.device());
+    let mut indices = Tensor::<u32>::new(vec![0], &vec![], x.device(), stream);
     let indices_desc = infinicore::Tensor::new(types::U32, std::iter::empty(), std::iter::empty());
 
     infini!(infiniopCreateRandomSampleDescriptor(
@@ -778,11 +807,11 @@ pub fn random_sample<T: Copy + Clone + Default>(
                 top_p,
                 top_k as i32,
                 temperature,
-                std::ptr::null_mut()
+                stream.as_raw()
             ));
         }
         DeviceType::CUDA => {
-            let mut workspace = device.malloc::<u8>(workspace_size);
+            let mut workspace = stream.malloc(workspace_size);
             infini!(infiniopRandomSample(
                 desc,
                 workspace.as_raw() as *mut _,
@@ -793,7 +822,7 @@ pub fn random_sample<T: Copy + Clone + Default>(
                 top_p,
                 top_k as i32,
                 temperature,
-                std::ptr::null_mut()
+                stream.as_raw()
             ));
         }
     }
@@ -813,6 +842,7 @@ pub fn self_attention<T: Copy + Clone + Default + Into<f32> + std::fmt::Debug>(
     v_cache: &mut Tensor<T>,
     pos: usize,
     device: &infinicore::Device,
+    stream: &infinicore::Stream,
 ) {
     let handle = infinicore::Handle::new();
     let nbytes = convert_type::<T>().nbytes() as isize;
@@ -856,11 +886,11 @@ pub fn self_attention<T: Copy + Clone + Default + Into<f32> + std::fmt::Debug>(
                 v.data().as_ptr() as *const _,
                 k_cache.data_mut().as_mut_ptr() as *mut _,
                 v_cache.data_mut().as_mut_ptr() as *mut _,
-                std::ptr::null_mut()
+                stream.as_raw()
             ));
         }
         DeviceType::CUDA => {
-            let mut workspace = device.malloc::<u8>(workspace_size);
+            let mut workspace = stream.malloc(workspace_size);
             infini!(infiniopAttention(desc,
                 workspace.as_raw() as *mut _,
                 workspace_size,
@@ -870,7 +900,7 @@ pub fn self_attention<T: Copy + Clone + Default + Into<f32> + std::fmt::Debug>(
                 v.dev_blob_ptr() as *const _,
                 k_cache.dev_blob_ptr_mut() as *mut _,
                 v_cache.dev_blob_ptr_mut() as *mut _,
-                std::ptr::null_mut()
+                stream.as_raw()
             ));
         }
     }
@@ -970,18 +1000,21 @@ fn test_rope() {
         0.6466
     ];
     
-    let mut device = infinicore::Device::default();
+    let device = infinicore::Device::new(infinicore::DeviceType::CUDA, 0);
+    let stream = device.stream();
 
     // 创建相同的输入tensor，分别用于原始rope和新rope
-    let mut original_tensor = Tensor::<f32>::new(random_data.clone(), &vec![seq_len, n_heads, d], &device);
-    let mut new_tensor = Tensor::<f32>::new(random_data.clone(), &vec![seq_len, n_heads, d], &device);
+    let mut original_tensor = Tensor::<f32>::new(random_data.clone(), &vec![seq_len, n_heads, d], &device, &stream);
+    let mut new_tensor = Tensor::<f32>::new(random_data.clone(), &vec![seq_len, n_heads, d], &device, &stream);
 
     // 执行原始rope操作
-    rope(&mut original_tensor, start_pos, theta);
+    rope(&mut original_tensor, start_pos, theta, &device, &stream);
+    
+    original_tensor.sync_data(DeviceType::CUDA, DeviceType::CPU);
 
     // println!("original_tensor: {:?}", original_tensor.data());
 
-    // 执行新rope操作（假设已实现）
+    // // 执行新rope操作（假设已实现）
     new_rope(&mut new_tensor, start_pos, theta);
 
     // println!("new_tensor: {:?}", new_tensor.data());
@@ -991,55 +1024,62 @@ fn test_rope() {
 
 #[test]
 pub fn test_self_attention() {
-    let mut device = infinicore::Device::default();
+    let mut device = infinicore::Device::new(infinicore::DeviceType::CUDA, 0);
+    let mut stream = device.stream();
     let seq_len = 4;
     let n_kv_h = 2;
     let n_groups = 2;
     let dqkv = 1;
-    let total_seq_len = 8;
-    let mut hidden_states = Tensor::<f32>::default(&vec![seq_len, n_kv_h * n_groups, dqkv], &device);
+    let past_seq_len = 8;
+    let mut hidden_states = Tensor::<f32>::default(&vec![seq_len, n_kv_h * n_groups, dqkv], &device, &stream);
     let q = Tensor::<f32>::new(
         vec![
-            0.07501934, 0.03810351, 0.07624029, 0.02104790, 0.02756642, 0.06471346,
-        0.01695717, 0.06440213, 0.04326092, 0.09738450, 0.05576990, 0.07929533,
-        0.06970619, 0.00332901, 0.08680507, 0.09460428
+            0.02011861, 0.01564183, 0.01431100, 0.06107866, 0.03273553, 0.06030527,
+        0.04742770, 0.08987745, 0.04837648, 0.09719032, 0.06108556, 0.06387556,
+        0.07505967, 0.08252688, 0.09228041, 0.02261754
         ],
         &vec![n_kv_h * n_groups, seq_len, dqkv],
-        &device
+        &device,
+        &stream
     );
     let mut k = Tensor::<f32>::new(
         vec![
-            0.03173396, 0.07719559, 0.09175372, 0.04245919, 0.04219837, 0.01831813,
-        0.05825133, 0.04863298
+            0.04742759, 0.06578235, 0.08828070, 0.00053720, 0.02843281, 0.01357504,
+        0.02540496, 0.02725527
         ],
         &vec![n_kv_h, seq_len, dqkv],
-        &device
+        &device,
+        &stream
     );
     let mut v = Tensor::<f32>::new(
         vec![
-            0.02179549, 0.01165751, 0.03982254, 0.08162189, 0.04339119, 0.00063249,
-        0.05911496, 0.05535178
+            0.06350761, 0.08783182, 0.07961719, 0.07970183, 0.01728158, 0.06944127,
+        0.07473563, 0.03949384
         ],
         &vec![n_kv_h, seq_len, dqkv],
-        &device
+        &device,
+        &stream
     );
     let mut k_cache = Tensor::<f32>::new(
         vec![
-            0.09918365, 0.01031387, 0.07083724, 0.01287274, 0.09505566, 0.03446914,
-        0.03289497, 0.08557402, 0.02675064, 0.04614840, 0.07013312, 0.08869162,
-        0.07064439, 0.00436187, 0.02215201, 0.05467457
+            0.04111669, 0.01010628, 0.08132364, 0.05185088, 0.08872802, 0.04866668,
+        0.08023688, 0.09768923, 0.00842632, 0.05856500, 0.05487223, 0.04931092,
+        0.03199102, 0.07740910, 0.01613889, 0.05153584, 0.01544362, 0.00656211,
+        0.06428026, 0.03599988, 0.06478178, 0.01619393, 0.02790077, 0.01082140
             ],
-            &vec![n_kv_h, total_seq_len, dqkv],
-            &device
+            &vec![n_kv_h, past_seq_len + seq_len, dqkv],
+            &device,
+            &stream
     );
     let mut v_cache = Tensor::<f32>::new(
         vec![
-            0.00567356, 0.09062338, 0.05695992, 0.06159676, 0.01643596, 0.02609916,
-        0.06027269, 0.03515903, 0.05011621, 0.04568907, 0.02459981, 0.00277210,
-        0.08462793, 0.02514033, 0.09587718, 0.05959567
+            0.01411267, 0.04142485, 0.04493250, 0.06022021, 0.09965058, 0.05558475,
+        0.04733684, 0.04265231, 0.06179113, 0.03227205, 0.00872639, 0.07630239,
+        0.05070712, 0.06774190, 0.03377264, 0.01764517, 0.03702318, 0.07238082,
+        0.04281357, 0.08754810, 0.03157927, 0.06003075, 0.06223378, 0.06835511
         ],
-        &vec![n_kv_h, total_seq_len, dqkv], &device);
-    let pos = 0;
+        &vec![n_kv_h, past_seq_len + seq_len, dqkv], &device, &stream);
+    let pos = past_seq_len;
     self_attention(
         &mut hidden_states,
         &q,
@@ -1048,21 +1088,101 @@ pub fn test_self_attention() {
         &mut k_cache,
         &mut v_cache,
         pos,
-        &device
+        &device,
+        &stream
     );
+    hidden_states.sync_data(device.get(), DeviceType::CPU);
 
     // println!("hidden_states: {:?}", hidden_states.data());
 
     assert!(hidden_states.close_to(
         &Tensor::<f32>::new(
             vec![
-                0.02179549, 0.02179549, 0.04339119, 0.04339119, 0.01672211, 0.01671904,
-        0.02203670, 0.02201269, 0.02443392, 0.02442713, 0.03440190, 0.03441434,
-        0.03872065, 0.03871301, 0.03964926, 0.03965440
+                0.05216197, 0.05216444, 0.04743605, 0.04743669, 0.05572842, 0.05573700,
+        0.04963323, 0.04963357, 0.05790064, 0.05790820, 0.05191493, 0.05191369,
+        0.05972077, 0.05972375, 0.05088011, 0.05088138
             ],
             &vec![seq_len, n_kv_h * n_groups, dqkv],
-            &device
+            &device,
+            &stream
         ),
         1e-6
     ));
 }
+
+// #[test]
+// pub fn test_self_attention() {
+//     let mut device = infinicore::Device::default();
+//     let seq_len = 2;
+//     let total_seq_len = 4;
+//     let past_seq_len = total_seq_len - seq_len;
+//     let n_kv_h = 2;
+//     let n_groups = 1;
+//     let dqkv = 3;
+
+//     // Initialize simple test tensors for Q, K, and V
+//     let q_data = vec![
+//         0.1, 0.2, 0.3, // Q for seq_idx 0, head 0
+//         0.4, 0.5, 0.6, // Q for seq_idx 1, head 0
+//         0.7, 0.8, 0.9, // Q for seq_idx 0, head 1
+//         1.0, 1.1, 1.2, // Q for seq_idx 1, head 1
+//     ];
+//     let mut q = Tensor::<f32>::new(q_data, &vec![seq_len, n_kv_h * n_groups * dqkv], &device);
+
+//     let k_data = vec![
+//         0.1, 0.2, 0.3, // K for total_seq_idx 0, head 0
+//         0.4, 0.5, 0.6, // K for total_seq_idx 1, head 0
+//         0.7, 0.8, 0.9, // K for total_seq_idx 2, head 0
+//         1.0, 1.1, 1.2, // K for total_seq_idx 3, head 0
+//         1.3, 1.4, 1.5, // K for total_seq_idx 0, head 1
+//         1.6, 1.7, 1.8, // K for total_seq_idx 1, head 1
+//         1.9, 2.0, 2.1, // K for total_seq_idx 2, head 1
+//         2.2, 2.3, 2.4, // K for total_seq_idx 3, head 1
+//     ];
+//     let mut k = Tensor::<f32>::new(k_data, &vec![total_seq_len, n_kv_h * dqkv], &device);
+
+//     let v_data = vec![
+//         0.1, 0.2, 0.3, // V for total_seq_idx 0, head 0
+//         0.4, 0.5, 0.6, // V for total_seq_idx 1, head 0
+//         0.7, 0.8, 0.9, // V for total_seq_idx 2, head 0
+//         1.0, 1.1, 1.2, // V for total_seq_idx 3, head 0
+//         1.3, 1.4, 1.5, // V for total_seq_idx 0, head 1
+//         1.6, 1.7, 1.8, // V for total_seq_idx 1, head 1
+//         1.9, 2.0, 2.1, // V for total_seq_idx 2, head 1
+//         2.2, 2.3, 2.4, // V for total_seq_idx 3, head 1
+//     ];
+//     let mut v = Tensor::<f32>::new(v_data, &vec![total_seq_len, n_kv_h * dqkv], &device);
+
+//     // Initialize attention score tensor and hidden_states
+//     let mut att_scores = Tensor::<f32>::default(&vec![n_kv_h, n_groups, seq_len, total_seq_len], &device);
+//     let mut hidden_states = Tensor::<f32>::default(&vec![seq_len, n_kv_h * n_groups * dqkv], &device);
+
+//     // Run self_attention
+//     self_attention(
+//         hidden_states.reshape(&vec![seq_len, n_kv_h * n_groups, dqkv]),
+//         q.reshape(&vec![seq_len, n_kv_h * n_groups, dqkv]).permute(&vec![1, 0, 2]),
+//         k.slice(past_seq_len * n_kv_h * dqkv, &vec![seq_len, n_kv_h * dqkv]).reshape(&vec![seq_len, n_kv_h, dqkv]).permute(&vec![1, 0, 2]),
+//         v.slice(past_seq_len * n_kv_h * dqkv, &vec![seq_len, n_kv_h * dqkv]).reshape(&vec![seq_len, n_kv_h, dqkv]).permute(&vec![1, 0, 2]),
+//         k.reshape(&vec![total_seq_len, n_kv_h, dqkv]).permute(&vec![1, 0, 2]),
+//         v.reshape(&vec![total_seq_len, n_kv_h, dqkv]).permute(&vec![1, 0, 2]),
+//         past_seq_len,
+//         &device
+//     );
+
+//     // Check the results (example expected results, calculated manually for f32)
+//     let expected_hidden_states = Tensor::<f32>::new(
+//         vec![
+//             0.7825454, 0.8825454, 0.9825454, // Output for seq_idx 0, head 0
+//             1.1990090, 1.2990088, 1.3990089, // Output for seq_idx 0, head 1
+//             1.5267198, 1.6267197, 1.7267196, // Output for seq_idx 1, head 0
+//             1.9442390, 2.0442388, 2.1442390, // Output for seq_idx 1, head 1
+//         ],
+//         &vec![seq_len, n_kv_h * n_groups * dqkv],
+//         &device
+//     );
+
+//     println!("hidden_states: {:?}", hidden_states.data());
+
+//     // Use float_eq for comparison of floating-point values
+//     assert!(hidden_states.reshape(&vec![seq_len, n_kv_h * n_groups * dqkv]).close_to(&expected_hidden_states, 1e-5));
+// }
